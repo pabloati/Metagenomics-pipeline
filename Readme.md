@@ -6,4 +6,9 @@ The main pipeline consists of an initial preprocessing of the raw fastq files us
   
   The reads were were preprocessed using a [snakemake workflow](https://github.com/pabloati/Metagenomics-pipeline/blob/main/Preprocessing.smk) which also produced the [MultiQC](https://github.com/ewels/MultiQC) report from all the reads analyzed and cleaned by Fastp. 
 
-  ## Fastp
+  ### Fastp
+
+
+## 2. MetaPhlAn pipeline
+
+  Metaphlan is run with an option to output the absolute counts. Custom scripts were used to correctly assign the patients IDs to each of the samples, and to produce a table that contained the absolute counts. Metaphlan's basic output of relative counts was merged using the already exiting metaphlan's scripts
