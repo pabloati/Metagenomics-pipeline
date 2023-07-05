@@ -4,4 +4,6 @@ The main pipeline consists of an initial preprocessing of the raw fastq files us
 
 ## 1. Preprocessing
   
-  The reads were were preprocessed using a [snakemake workflow](https://github.com/pabloati/Metagenomics-pipeline/blob/main/Preprocessing.smk) which also produced the [MultiQC](https://github.com/ewels/MultiQC) report from all the reads analyzed and cleaned by Fastp
+  The reads were were preprocessed using a [snakemake workflow](https://github.com/pabloati/Metagenomics-pipeline/blob/main/Preprocessing.smk) which also produced the [MultiQC](https://github.com/ewels/MultiQC) report from all the reads analyzed and cleaned by Fastp. 
+
+  ## Fastp
