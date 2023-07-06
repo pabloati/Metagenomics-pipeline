@@ -1,0 +1,2069 @@
+---
+title: "Thesis_Final"
+author: "Pablo Atienza"
+date: "2023-05-16"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warnings = FALSE, message = FALSE)
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+suppressMessages(library(tidyverse))
+suppressMessages(library(readr))
+suppressMessages(library(phyloseq))
+suppressMessages(library(microbiomeutilities))
+suppressMessages(library(readxl))
+suppressMessages(library(mia))
+library(miaTime)
+library(miaViz)
+library(factoextra)
+library(patchwork)
+library(mice)
+library(miceadds)
+library(ellipse)
+library(FactoMineR)
+library(scater)
+library(ggsignif)
+library(patchwork)
+library(vegan)
+library(DESeq2)
+library(ggforce)
+library(caret) # To divide into test and training set
+library(randomForest)
+library(mltools)
+library(pROC)
+load("RData/Functions.RData") # Loads etaphlanToPhyloseq,name_changer,calculate_metrics,permanova_dist
+load("RData/Thesis_objs.RData")
+m.color <- c("#CC3333","#6699CC")
+maroon_scale <- c("#990000","#CC3333", "#FF6666")
+control_scale <- c("#336699","#6699CC", "#99CCFF")
+```
+
+
+```{r}
+table(colData(tse_filt)[tse_filt$Fecal_sample_ON_days < 45,"Diagnosis"])/nrow(colData(tse_filt)[tse_filt$Fecal_sample_ON_days < 45,"Diagnosis"])
+```
+
+# Data loading
+
+This initial chunk will load the main TSE objects that will be used in the code:
+
+```{r cars}
+#save(tse,tse_bs,tse_filt,dds,rest,tax.df,metadata_comp,famd.res, fancy.df ,file = "RData/Thesis_objs.RData")
+#save(metaphlanToPhyloseq,name_changer,calculate_metrics,permanova_dist,RF_trial,file = "RData/Functions.RData")
+```
+1. tse -> Main TSE object, that contains the raw data. It has all of the patients, and also the original assays from Metaphlan.
+
+2. tse_bs -> Final TSE object with only the species of the ON patients. It is unfiltered and contains all of the needed matrices.
+
+3. tse_filt -> Final TSE object, with the same data as tse_bs but filtered to eliminate species under 0.001% of relab, that are present in less than 10% of the samples (FP)
+
+4. dds -> Deseq2 experiment
+
+5. rest -> Result of DESeq2 in a data frame format
+
+6. tax.df -> Data frame with the taxonomic information of the experiment
+
+7. metadata_comp -> Metadata of the patients with the imputed values from mice
+
+8. famd.res -> FAMD object with the results of the clinical data of all the ON patients
+
+9. frich.df -> Dataframe with the rarefacion curve
+
+10. volc.df -> Modified dataframe for the volcano plot
+
+11. fancy.df -> Modified dataframe for the plot of the relative abundance of DA bact
+
+Tse_filt transformations
+```{r}
+rownames(tse_bs) <- gsub("Species:","",rownames(tse_bs))
+tse_filt <- subsetByPrevalentTaxa(tse[,tse$disease_group == "ON_debut" & !is.na(tse$Diagnosis)],
+                                  rank = "Species",
+                                  detection = 0.00001,
+                                  prevalence = 0.10,
+                                  as_relative = TRUE)
+colnames(tse_filt) <- gsub("_debut","",colnames(tse_filt))
+
+# assay(tse_filt,"count") <- MetaLonDA::normalize(assay(tse_filt,"counts"),method = "css")
+tse_filt <- transformCounts(tse_filt,method = "relabundance",name = "relabundance")
+# Richness
+tse_filt <- mia::estimateRichness(tse_filt,
+                                  assay_name = "counts",
+                                  index  = "observed",
+                                  name = "observed")
+# Shannon index
+tse_filt <- mia::estimateDiversity(tse_filt,
+                              assay_name = "counts",
+                              index = "shannon",
+                              name = "shannon")
+
+# Faith's PD
+tse_filt <- addTaxonomyTree(tse_filt)
+tse_filt <- mia::estimateFaith(tse_filt,
+                          assay_name = "counts")
+
+# Bray-Curtis PCoA
+tse_filt <- runMDS(tse_filt, FUN = vegan::vegdist, method = "bray", name = "PCoA_BC", exprs_values = "relabundance")
+
+# Jaccard PCoA
+tse_filt <- runMDS(tse_filt, FUN = vegan::vegdist, method = "jaccard", name = "PCoA_JA", exprs_values = "relabundance")
+
+# Canberra PCoA
+tse_filt <- runMDS(tse_filt,FUN = vegan::vegdist,method = "canberra",name = "PCoA_CB", exprs_values = "relabundance" )
+
+# CLR-Transform
+tse_filt <- transformCounts(tse_filt, method = "relabundance", name = "pseudorel", pseudocount = 1)
+tse_filt <- transformCounts(tse_filt, method = "clr",
+                            assay_name = "pseudorel",
+                            name = "clr")
+# Pseudocount for DESeq2
+assay(tse_filt,"pseudo") <- assay(tse_filt,"counts") + 1
+colData(tse_filt)$Diagnosis <- as.factor(colData(tse_filt)$Diagnosis)
+rownames(tse_filt) <- gsub("Species:","",rownames(tse_filt))
+
+
+
+```
+
+
+# FAMD of the ON patients
+
+Main plot
+```{r}
+eig.val <- get_eigenvalue(famd.res)
+# Do it
+as.data.frame(famd.res$ind$coord) %>% rownames_to_column(var = "person_id") %>%
+  dplyr::inner_join(as.data.frame(colData(tse_filt))[,c("person_id","Diagnosis")],by = "person_id") %>%
+  column_to_rownames(var = "person_id") %>%
+  select(Diagnosis,everything()) -> famd.df
+famd.df %>%
+              ggplot(aes(x=Dim.1,y=Dim.2,color=Diagnosis,fill = Diagnosis)) +
+              geom_point(size = 0.25) +
+              stat_ellipse(geom = "polygon",alpha = 0.2) +
+              scale_color_manual(values = m.color) +
+              scale_fill_manual(values = m.color) +
+              labs(#title = "FAMD of the ON patients at baseline",
+                   x = paste0("PC1 (",round(eig.val[1,2],2),"%)"), 
+                   y = paste0("PC2 (",round(eig.val[2,2],3),"%)")) +
+              theme_bw() +
+              theme(text = element_text(size = 10,
+                                        family = "serif"),
+                    legend.position = "bottom",
+                    legend.title = element_blank())
+ggsave("final_plots/ON_baseline_FAMD.png",width = 4, height = 3, dpi = 300)
+```
+
+```{r}
+anova(famd.df[,-1] ~ Diagnosis,
+        data = famd.df,
+        method = "euclidean")
+
+ anova.cca(famd.df,
+                          by = "margin", # each term (here only 'Diagnosis') analyzed individually
+                          method = "canberra",
+                          permutations = 999)
+
+famd.df
+```
+
+
+# Alpha Diversity
+
+Plots of the Alpha-diversity metrics
+
+## Richness
+
+```{r pressure, echo=FALSE}
+as.data.frame(colData(tse_filt)) %>% 
+  ggplot(aes(x = Diagnosis, y = observed, color = Diagnosis)) +
+  geom_violin(fill = "#F1F1F1",color = "gray",alpha = 0.5) +
+  ggbeeswarm::geom_quasirandom(size = 3) +
+  geom_signif(comparisons = list(c("MS-converter","non-converter")), 
+              map_signif_level = FALSE,
+              color = "black",
+              test = "wilcox.test",
+              test.args = c(exact = FALSE),
+              tip_length = 0,
+              textsize = 8) +
+  theme_bw() +
+  theme(text = element_text(size = 25,
+                            family = "serif"),
+        legend.position = "None",
+        axis.title.x = element_blank()) + 
+  labs(#title = "Richness of ON patients",
+       x = "Patients Groups",
+       y = expression(Richness[Observed])) +
+  scale_color_manual(values = m.color) +
+  ylim(c(0,400))
+ggsave("final_plots/ON_baseline_richness.png",width = 7,height = 7, dpi = 300)
+```
+
+## Evennes
+
+The Shannon Index is the selected eveness measure
+
+```{r}
+as.data.frame(colData(tse_filt)) %>% 
+  ggplot(aes(x = Diagnosis, y = shannon, color = Diagnosis)) +
+  geom_violin(fill = "#F1F1F1",color = "gray",alpha = 0.5) +
+  ggbeeswarm::geom_quasirandom(size = 3) +
+  theme_bw() +
+  geom_signif(comparisons = list(c("MS-converter","non-converter")), 
+              map_signif_level = FALSE,
+              color = "black",
+              textsize = 8,
+              tip_length = 0,
+              test = "wilcox.test",
+              test.args = c(exact = FALSE)) + 
+  theme(text = element_text(size = 25,
+                            family = "serif"),
+        legend.position = "None",
+        axis.title.x = element_blank()) +
+  labs(#title = "Shannon index for the ON patients",
+       y = "Shannon index") +
+  scale_color_manual(values = m.color) +
+  ylim(2,5.15)
+ggsave("final_plots/ON_baseline_shannon.png",width = 7,height = 7, dpi = 300)
+```
+## Faith's Phylogenetic Diversity
+
+```{r}
+as.data.frame(colData(tse_filt)) %>% 
+  ggplot(aes(x = Diagnosis, y = faith, color = Diagnosis)) +
+  geom_violin(fill = "#F1F1F1",color = "gray",alpha = 0.5) +
+  ggbeeswarm::geom_quasirandom(size = 3) +
+  theme_bw() +
+  geom_signif(comparisons = list(c("MS-converter","non-converter")), 
+              map_signif_level = FALSE,
+              color = "black",
+              textsize = 8,
+              tip_length = 0,
+              test = "wilcox.test",
+              test.args = c(exact = FALSE)) + 
+  theme(text = element_text(size = 25,
+                            family = "serif"),
+        legend.position = "None",
+        axis.title.x = element_blank()) +
+  labs(#title = "Shannon index for the ON patients",
+       y = "Faith' PD") +
+  scale_color_manual(values = m.color) +
+  ylim(20,100)
+ggsave("final_plots/ON_baseline_FPD.png",width = 7,height = 7, dpi = 300)
+```
+
+# Beta-diversity Measures
+
+
+## Bray-Curtis dissimilarity
+
+```{r}
+# Explained variance for each axis
+e <- attr(reducedDim(tse_filt, "PCoA_BC"), "eig");
+rel_eig <- e/sum(e[e>0])      
+df <- as.data.frame(reducedDim(tse_filt, "PCoA_BC"))
+colnames(df) <- c("PC1","PC2")
+df <- cbind(df,"Diagnosis" = tse_filt$Diagnosis) 
+
+df %>%
+  ggplot(aes(x=PC1,y=PC2,color=Diagnosis)) +
+  geom_point() +
+  stat_ellipse(aes(fill = Diagnosis),
+               geom = "polygon",
+               alpha = 0.2) +
+  theme_bw() +
+  labs(#title = "Main PCoA of patients at baseline (Bray-Curtis)",
+              x = paste("PCoA 1 (", round(100 * rel_eig[[1]],1), "%", ")", sep = ""),
+              y = paste("PCoA 2 (", round(100 * rel_eig[[2]],1), "%", ")", sep = "")) +
+  theme(text = element_text(size = 25,
+                            family = "serif"),
+        legend.title = element_blank(),
+        legend.position = "bottom") +
+  scale_fill_manual(values = m.color) +
+  scale_color_manual(values = m.color)
+
+ggsave("final_plots/ON_baseline_BC.png",width = 7,height = 7, dpi = 300)
+```
+```{r}
+permanova_dist("bray")
+```
+
+
+## Jaccard PCoA
+
+```{r}
+# Explained variance for each axis
+e <- attr(reducedDim(tse_filt, "PCoA_JA"), "eig");
+rel_eig <- e/sum(e[e>0])      
+df <- as.data.frame(reducedDim(tse_filt, "PCoA_JA"))
+colnames(df) <- c("PC1","PC2")
+df <- cbind(df,"Diagnosis" = tse_filt$Diagnosis) 
+
+df %>%
+  ggplot(aes(x=PC1,y=PC2,color=Diagnosis)) +
+  geom_point() +
+  stat_ellipse(aes(fill = Diagnosis),
+               geom = "polygon",
+               alpha = 0.2) +
+  theme_bw() +
+  labs(#title = "Main PCoA of patients at baseline (Bray-Curtis)",
+              x = paste("PCoA 1 (", round(100 * rel_eig[[1]],1), "%", ")", sep = ""),
+              y = paste("PCoA 2 (", round(100 * rel_eig[[2]],1), "%", ")", sep = "")) +
+  theme(text = element_text(size = 25,
+                            family = "serif"),
+        legend.title = element_blank(),
+        legend.position = "bottom") +
+  scale_fill_manual(values = m.color) +
+  scale_color_manual(values = m.color)
+
+ggsave("final_plots/ON_baseline_Jac.png",width = 7,height = 7, dpi = 300)
+```
+```{r}
+permanova_dist("jaccard")
+```
+## Canberra PCoA
+
+```{r}
+# Explained variance for each axis
+e <- attr(reducedDim(tse_filt, "PCoA_CB"), "eig");
+rel_eig <- e/sum(e[e>0])      
+# Extracting the Principal components for the reduction of the Canberra Distance
+df <- as.data.frame(reducedDim(tse_filt, "PCoA_CB"))
+colnames(df) <- c("PC1","PC2")
+df <- df %>% rownames_to_column(var = "person_id") %>%
+  dplyr::left_join(as.data.frame(colData(tse_filt)),by="person_id")
+
+tse_filt <- addPerCellQC(tse_filt)
+  
+df %>%
+  filter(Fecal_sample_ON_days < 100) %>%
+  ggplot(aes(x=PC1,y=PC2,color=Fecal_sample_ON_days,shape = Diagnosis)) +
+  geom_point() +
+  stat_ellipse(aes(fill = sum),
+                geom = "polygon",
+                alpha = 0.2) +
+  theme_bw() +
+  labs(#title = "Main PCoA of patients at baseline (Canberra)",
+              x = paste("PCoA 1 (", round(100 * rel_eig[[1]],1), "%", ")", sep = ""),
+              y = paste("PCoA 2 (", round(100 * rel_eig[[2]],1), "%", ")", sep = "")) +
+  theme(text = element_text(size = 25,
+                            family = "serif"),
+        legend.title = element_blank(),
+        legend.position = "bottom") +
+  scale_fill_manual(values = m.color) +
+  scale_color_gradient(low="yellow",high="purple")
+  
+
+#ggsave("final_plots/ON_baseline_CB.png",width = 7,height = 7, dpi = 300)
+```
+```{r}
+colnames(colData(tse_filt))
+```
+
+
+Permanova
+```{r}
+set.seed(123)
+permanova <- adonis2(t(assay(tse_filt,"relabundance")) ~ Diagnosis ,
+        data = colData(tse_filt),
+        method = "canberra")
+  dbrda <- dbrda(t(assay(tse_filt,"relabundance")) ~ Diagnosis, 
+                 data = colData(tse_filt),
+                 distance = "canberra")
+  # Perform permutational analysis
+  permanova2 <- anova.cca(dbrda,
+                          by = "margin", # each term (here only 'Diagnosis') analyzed individually
+                          method = "canberra",
+                          permutations = 999)
+  # Get p-values
+  p_values <- c( permanova["Diagnosis", "Pr(>F)"], permanova2["Diagnosis", "Pr(>F)"] )
+  p_values <-as.data.frame(p_values)
+  rownames(p_values) <- c("adonis2", "dbRDA+anova.cca")
+p_values  
+sppscores(dbrda) <- t(assay(tse_filt,"relabundance"))
+  # Get coefficients
+  coef <- dbrda$CCA$v
+  # Get the taxa with biggest weights
+  top.coef <- head( coef[rev(order(abs(coef))), , drop = FALSE], 20)
+  # Sort weights in increasing order
+  top.coef <- top.coef[ order(top.coef), ]
+  # Get top names
+  top_names <- gsub("_"," ",names(top.coef)[ order(abs(top.coef), decreasing = TRUE) ])
+  
+  # Modify the group names so they fit the plot
+  names(top.coef) <- gsub("_"," ",names(top.coef))
+  ggplot(data.frame(x = top.coef,
+                    y = factor(names(top.coef),unique(names(top.coef)))),
+          aes(x = x, y = y, fill = x < 0)) +
+      geom_bar(stat="identity") +
+      #labs(title=paste0("Top different using canberra distance\n(pval = ",p_values[1,1],")")) +
+      theme_bw() +
+    theme(text = element_text(size = 15,
+                              family = "serif"),
+          axis.text.y = element_text(face = "bold"),
+          legend.position = "None",
+          axis.title = element_blank()) +
+    scale_fill_manual(values = m.color)
+
+ggsave("final_plots/Permanova_BC.png", width = 7,height = 7, dpi = 300)  
+```
+
+
+
+## Aitchison distance
+
+The distance of the samples based on the CLR transform. It modifies compositional data 
+```{r}
+# Getting clr table and changing taxa to columns
+clr_assay <- t(assays(tse_filt)$clr)
+euclidean_dist <- vegan::vegdist(clr_assay, method = "euclidean")
+ 
+# Doing PCoA
+euclidean_pcoa <- ecodist::pco(euclidean_dist)
+variance <- euclidean_pcoa$values
+prop_var <- round(variance/sum(variance) * 100, 2)  # Creates a data frame from principal coordinates
+euclidean_pcoa_df <- data.frame(
+  pcoa1 = euclidean_pcoa$vectors[,1], 
+  pcoa2 = euclidean_pcoa$vectors[,2])
+
+euclidean_pcoa_df <- cbind(euclidean_pcoa_df,
+                           Diagnosis = colData(tse_filt)$Diagnosis)
+
+
+# Creates a plot
+ggplot(data = euclidean_pcoa_df,
+                   aes(x=pcoa1, y=pcoa2,color = Diagnosis)) +
+  geom_point(size = 1.5) +
+  stat_ellipse(geom = "polygon",
+               aes(fill = Diagnosis), alpha = 0.2) +
+  labs(x = paste0("PC1 (",prop_var[1],"%)"),
+       y = paste0("PC2 (",prop_var[2],"%)"),
+       title = paste0("Aitchison plot")) +  
+  theme_bw() +
+  theme(text = element_text(size = 20,
+                            family = "serif"),
+        legend.position = "bottom") +
+  scale_fill_manual(values = m.color) +
+  scale_color_manual(values = m.color)
+
+ggsave("final_plots/ON_baseline_AD.png",width = 7,height = 7, dpi = 300)
+```
+
+# Phylum abundances
+
+```{r,fig.height=7,fig.width=7}
+plot_filt <- plotAbundance(tse_filt, assay_name="relabundance",rank="Phylum",order_rank_by = "abund", order_sample_by = "Diagnosis",features = "Diagnosis") 
+plot_filt[[1]] <- plot_filt[[1]] + theme(text = element_text(family = "serif"), axis.title.x =  element_blank()) 
+plot_filt[[2]] <- plot_filt[[2]] + theme(text = element_text(family = "serif"), axis.ticks.y = element_blank()) + scale_fill_manual(values = m.color) + labs(fill = "Diagnosis")
+wrap_plots(plot_filt,nrow = 2,heights = c(0.9,0.1))
+
+ggsave("final_plots/ON_baseline_phyla.png",width = 7,height = 7, dpi = 300)
+```
+
+# Species prevalence
+
+Preparing data:
+```{r}
+species_prevalence <- as.data.frame(rbind(getPrevalence(tse_filt[,tse_filt$Diagnosis == "MS-converter"], 
+                                          detection = 1/100, 
+                                          sort = TRUE, as_relative = TRUE),
+                            getPrevalence(tse_filt[,tse_filt$Diagnosis == "non-converter"], detection = 1/100, sort = TRUE, as_relative = TRUE),
+                            getPrevalence()))
+
+rownames(species_prevalence) <- c("MS-converters","non-converters")
+colnames(species_prevalence) <- gsub("Species:","",colnames(species_prevalence))
+```
+
+```{r}
+species_prevalence %>%
+  dplyr::select(1:10) %>%
+  rownames_to_column(var = "Diagnosis") %>%
+  pivot_longer(-Diagnosis) %>%
+  group_by(name,Diagnosis) %>%
+  ggplot(aes(x = Diagnosis, y = value, color = gsub("_"," ",name))) +
+  geom_point() +
+  geom_line(aes(group = name)) +
+  theme_bw() +
+  labs(color = "Bacteria species",
+       y = "Prevalence") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  theme(text = element_text(size = 10,
+                            family = "serif"),
+        legend.text = element_text(size = 7))
+```
+
+# Differential abundance (DESeq2)
+
+The rest object comes from comparing the MS-converters against non-converters, using a bonferroni correction for the FDR. 
+```{r}
+count_data <- assays(tse_filt)$pseudo
+col_data <- as.data.frame(colData(tse_filt)) %>%
+  mutate(Diagnosis = ifelse(Diagnosis == "MS-converter","MS","Non"),
+         Time = disease_group)%>%
+         dplyr::select(Diagnosis)
+
+# Converting to factors so DDS can work fine
+col_data$Diagnosis <- as.factor(col_data$Diagnosis)
+col_data$Diagnosis <- relevel(col_data$Diagnosis,"Non")
+
+
+dds <- DESeqDataSetFromMatrix(countData = count_data,
+                              colData = col_data,
+                              design = ~ Diagnosis)
+dds <-DESeq(dds)
+```
+
+```{r}
+rest <- results(dds,contrast = c("Diagnosis","MS","Non"),
+                tidy = TRUE,
+                pAdjustMethod = "BH")
+
+rest %>% filter(padj < 0.01 ) %>% nrow
+rest %>% filter(padj < 0.01 & log2FoldChange > 0) %>% nrow
+rest %>% filter(padj < 0.01 & log2FoldChange < 0) %>% nrow
+```
+
+
+
+Volcano plot:
+
+```{r}
+library(ggrepel)
+
+as.data.frame(assay(tse_filt,"relabundance")) %>%
+  rownames_to_column(var="Species") %>%
+  pivot_longer(-Species,names_to = "person_id")%>%
+  dplyr::inner_join(as.data.frame(colData(tse_filt)[,c("person_id","Diagnosis")])
+                    ,by = "person_id") %>%
+  group_by(Diagnosis,Species) %>%
+  summarise(mean = mean(value)) %>%
+  ungroup() %>%
+  group_by(Species) %>% 
+  summarise(dif = abs(mean[Diagnosis == "MS-converter"] - mean[Diagnosis == "non-converter"])) %>% 
+  arrange() %>%
+  dplyr::inner_join(rest,by=c("Species" = "row")) %>%
+  mutate(Species = map_chr(Species,name_changer),
+         Species = ifelse(str_detect(Species,"s__"),
+                          gsub("s__","",Species),
+                          paste0(gsub("[a-z]__","",Species),"_unkown"))) %>%
+  mutate(name_in = ifelse(dif >= 0.001 & padj < 0.01 & log2FoldChange > 0,Species,NA),
+         name_de = ifelse(dif >= 0.001 & padj < 0.01 & log2FoldChange < 0,Species,NA)) -> volc.df
+```
+
+```{r}
+volc.df %>%
+  ggplot(aes(x=log2FoldChange,y=-log10(padj), color = padj > 0.01, size = dif)) +
+  geom_point(alpha = 0.7) +
+  ggrepel::geom_text_repel(data = subset(volc.df,log2FoldChange <10),
+                           aes(label = gsub("_"," ",name_in), point.size = dif),
+                           family = "serif", color = "black",
+                           size = 3,
+                           force = 5, direction = "y",
+                           nudge_x = 10 - subset(volc.df,log2FoldChange < 10)$log2FoldChange,
+                           nudge_y = 10,
+                           point.padding = 0.2, # additional padding around each point
+                           min.segment.length = 0, # draw all line segments
+                           max.time = 1, max.iter = 1e5, # stop after 1 second, or after 100,000 iterations
+                           box.padding = 0.3, # additional padding around each text label
+                           arrow = arrow(length = unit(2, "mm"), ends = "last", type = "closed"),
+                           segment.linetype = "dashed",
+                           hjust = 2,
+                           max.overlaps = 100,
+                           xlim = c(9,100),
+                           ylim = c(0,15),
+                          ) +
+    ggrepel::geom_text_repel(data = subset(volc.df,log2FoldChange > 10),
+                           aes(label = gsub("_"," ",name_in), point.size = dif),
+                           family = "serif", color = "black",
+                           size = 3,
+                           force = 5, direction = "y",
+                           nudge_x = -5,
+                           nudge_y = 0,
+                           point.padding = 0.2, # additional padding around each point
+                           min.segment.length = 0, # draw all line segments
+                           max.time = 1, max.iter = 1e5, # stop after 1 second, or after 100,000 iterations
+                           box.padding = 0.5, # additional padding around each text label
+                           arrow = arrow(length = unit(2, "mm"), ends = "last", type = "closed"),
+                           segment.linetype = "dashed",
+                           hjust = 0,
+                           max.overlaps = 100,
+                           xlim = c(0,8),
+                           ylim = c(30,NA),
+                          ) +
+  ggrepel::geom_text_repel(aes(label = gsub("_"," ",name_de), point.size = dif),
+                           family = "serif", color = "black",
+                           size = 3,
+                           force = 5, direction = "y",
+                           nudge_x = -4,
+                           nudge_y = 0,
+                           min.segment.length = 0, # draw all line segments
+                           max.time = 1, max.iter = 1e5, # stop after 1 second, or after 100,000 iterations    
+                           box.padding = 0.3, # additional padding around each text label
+                           xlim = c(-6,0),
+                           ylim = c(0,10),
+                           arrow = arrow(length = unit(2, "mm"), ends = "last", type = "closed"),
+                           segment.linetype = "dashed",
+                           hjust = -10,
+                           max.overlaps = 100
+                          ) +
+  geom_vline(xintercept = 0, 
+             alpha = 0.75,
+             linetype="dashed")+
+  theme_bw() +
+  theme(text = element_text(size = 20,
+                            family = "serif"),
+        legend.position = "bottom") +
+  guides(size = FALSE) +
+  labs(x = "log2 Fold Change",
+       y = bquote(-log[10]~padj),
+       color = "Differentially abundant") +
+  scale_color_manual(values = c("#28B463","#CB4335"), 
+                     labels = c("Yes","No")) +
+  xlim(NA,20) +
+  ylim(NA,60)
+
+ggsave("final_plots/Volcano_plot.png",height = 7,width = 7,dpi = 300)
+```
+
+```{r}
+volc.df %>%
+  ggplot(aes(x=padj)) +
+  geom_histogram(fill = "#AF601A",
+                 binwidth = 0.01,
+                 color = "black",
+                 alpha = 0.7
+                 #fill = "#fad58a"
+                   ) +
+  theme_bw() +
+    labs(x = "Adjusted P-value",
+         y = "Count",
+         fill = "Differentially abundant") +
+  theme(text = element_text(size = 20,
+                            family = "serif"),
+        legend.position = "bottom") +
+  scale_fill_manual(values = c("#28B463","#CB4335"), 
+                     labels = c("Yes","No"))
+
+ggsave("final_plots/Pvalue_plot.png",height = 7,width = 7,dpi = 300)
+```
+
+## Overexpressed bacteria
+
+All:
+```{r}
+rest %>% filter(padj < 0.01 & log2FoldChange > 0) %>%
+  mutate(new_names = map_chr(row,name_changer),
+         row = gsub("_"," ",row)) %>%
+  select(row,new_names,everything()) %>%
+  arrange(padj)
+```
+
+Only taxa known at species level
+```{r}
+rest %>% filter(padj < 0.01 & log2FoldChange > 0) %>%
+  mutate(new_names = map_chr(row,name_changer),
+         row = gsub("_"," ",row)) %>%
+  arrange(padj) %>%
+  filter(!str_detect(row,"SGB")) %>%
+  select(row) 
+```
+
+```{r}
+
+plotCounts(dds,"Clostridium_disporicum",intgroup="Diagnosis")
+rest %>% filter(str_detect(row,"Clostridium")) %>% arrange(padj)
+```
+
+### Relativa abundance plot
+
+```{r}
+oe <- rest %>% filter(padj < 0.01 & log2FoldChange > 0) %>%
+  select(row) %>% unlist()
+
+as.data.frame(assay(tse_filt,"relabundance")) %>% 
+  rownames_to_column(var = "Species") %>%
+  filter(Species %in% oe[1:length(oe)/2]) %>% 
+  mutate(Species = map_chr(Species,name_changer),
+                  Species = ifelse(str_detect(Species,"s__"),
+                          gsub("s__","",Species),
+                          paste0(gsub("[a-z]__","",Species),"_unkown"))) %>%
+  pivot_longer(-Species,names_to = "person_id",values_to = "relabundance") %>%
+  dplyr::inner_join(as.data.frame(colData(tse_filt)[,c("person_id","Diagnosis")])) -> fancy.df
+
+as.data.frame(assay(tse_filt,"clr")) %>% 
+  rownames_to_column(var = "Species") %>%
+  filter(Species %in% oe[1:length(oe)/2]) %>% 
+  mutate(Species = map_chr(Species,name_changer),
+                  Species = ifelse(str_detect(Species,"s__"),
+                          gsub("s__","",Species),
+                          paste0(gsub("[a-z]__","",Species),"_unkown"))) %>%
+  pivot_longer(-Species,names_to = "person_id",values_to = "clr") %>%
+  dplyr::inner_join(as.data.frame(colData(tse_filt)[,c("person_id","Diagnosis")])) -> clr.df
+
+```
+
+```{r}
+fancy.df %>%
+  ggplot(aes(x=log(relabundance+1e-10), y=Species, fill = Diagnosis,color=Diagnosis)) +
+  geom_violin(position=position_dodge(1)) +
+  facet_grid(Species~.,scales = "free", margins = -10, switch = NULL) +
+    stat_summary(fun = "median",
+               geom = "point",
+               position = position_dodge(1),
+               color = "black") +
+  theme_bw() +
+  theme(text = element_text(size = 10,
+                            family = "serif"),
+        axis.text.y = element_text(face="bold"),
+        strip.background = element_blank(),
+        strip.text.y = element_blank()) +
+  scale_fill_manual(values = m.color) +
+  scale_color_manual(values = m.color)+
+  scale_x_continuous(labels = function(x) paste0((10**x )*100,"%"),limits = c(NA, 1)) +
+  scale_y_discrete(labels = function(x) gsub("_"," ",x))
+
+ggsave("aaTrial.png",width=5,height = 10,dpi =300 ) 
+```
+
+```{r}
+oe <- rest %>% filter(padj < 0.01 & log2FoldChange > 0) %>%
+  select(row) %>% unlist()
+
+as.data.frame(assay(tse_filt,"clr")) %>% 
+  rownames_to_column(var = "Species") %>%
+  filter(Species %in% oe[1:length(oe)/2]) %>% 
+  mutate(Species = map_chr(Species,name_changer),
+         Species = ifelse(str_detect(Species,"s__"),
+                          gsub("s__","",Species),
+                          paste0(gsub("[a-z]__","",Species),"_unkown"))) %>%
+  pivot_longer(-Species,names_to = "person_id",values_to = "relabundance") %>%
+  dplyr::inner_join(as.data.frame(colData(tse_filt)[,c("person_id","Diagnosis")])) -> fancy.df
+```
+
+```{r}
+library(ggbreak)
+
+
+custom_trans <- function() {
+  trans <- function(x) {
+    ifelse(x==0,-10000,log10(x) - log10(0.1))
+  }
+  inv <- function(x) {
+    ifelse(x==-1000,0,10^(x) - 0.1)
+  }
+  scales::trans_new("custom", transform = trans, inverse = inv)
+}
+
+
+
+fancy.df %>%
+  ggplot(aes(x=relabundance, y=Species, fill = Diagnosis,color=Diagnosis)) +
+  geom_violin(position=position_dodge(1)) +
+  facet_grid(Species~.,scales = "free_y", margins = -10, switch = NULL) +
+    stat_summary(fun = "mean",
+               geom = "point",
+               position = position_dodge(1),
+               color = "black") +
+  theme_bw() +
+  theme(text = element_text(size = 10,
+                            family = "serif"),
+        axis.text.y = element_text(face="bold"),
+        strip.background = element_blank(),
+        strip.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.spacing=unit(0, "lines")) +
+  scale_fill_manual(values = m.color) +
+  scale_color_manual(values = m.color) +
+  #scale_x_break(c(1,40),scales = 0.005) +
+  # scale_x_continuous(
+  #   trans = custom_trans(),
+  #   breaks = c(0, 0.1, 1, 10, 100),
+  #   labels = c("0", "0.1", "1", "10", "100")
+  #   )
+  # scale_x_continuous(
+  #   trans = scales::trans_new(
+  #     name = "log10_centered",
+  #     transform = function(x) log10(x + 0.1) - log10(0.1),
+  #     inverse = function(x) 10^(x + log10(0.1)) - 0.1),
+  #   breaks = c(0,0.01,0.1 ,1, 10,100),
+  #   labels = c("0", "0.01","0.1" ,"1", "10","100")
+  # 
+  # )
+  #scale_x_continuous(labels = function(x) paste0(x,"%"),
+                     #limits = c(NA,1)
+                     
+  #scale_x_continuous(labels = function(x) paste0((10**x )*100,"%"),limits = c(NA, 1)) +
+  scale_y_discrete(labels = function(x) gsub("_"," ",x))
+```
+
+```{r}
+fancy.df %>%
+  ggplot(aes(x=relabundance, y=Species, fill = Diagnosis,color=Diagnosis)) +
+  geom_violin(position=position_dodge(1)) +
+  facet_grid(Species~.,scales = "free", margins = -10, switch = NULL) +
+    stat_summary(fun = "mean",
+               geom = "point",
+               position = position_dodge(1),
+               color = "black") +
+  theme_bw() +
+  theme(text = element_text(size = 10,
+                            family = "serif"),
+        axis.text.y = element_text(face="bold"),
+        strip.background = element_blank(),
+        strip.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.spacing=unit(0, "lines")) +
+  scale_fill_manual(values = m.color) +
+  scale_color_manual(values = m.color) +
+  scale_y_discrete(labels = function(x) gsub("_"," ",x))
+ 
+```
+
+
+
+## Underexpressed bacteria
+
+All:
+```{r}
+rest %>% filter(padj < 0.01 & log2FoldChange < 0) %>%
+  mutate(new_names = map_chr(row,name_changer),
+         row = gsub("_"," ",row)) %>%
+  select(row,new_names,everything()) %>%
+  arrange(padj)
+```
+Only taxa known at species level
+```{r}
+rest %>% filter(padj < 0.01 & log2FoldChange < 0) %>%
+  mutate(new_names = map_chr(row,name_changer),
+         row = gsub("_"," ",row)) %>%
+  arrange(padj) %>%
+  filter(!str_detect(row,"SGB")) %>%
+  select(row) 
+```
+
+# Random Forest Classifier
+
+
+## Original
+Data selection:
+```{r}
+# Get relative abundance matrix of the DA species
+DA_sp <- rest %>% filter(padj < 0.01) %>%
+  select(row) %>% unlist
+
+df_rel <- as.data.frame(assay(tse_filt,"relabundance"))[DA_sp,] #Direct subset of the DA species
+
+# Merge the Diagnosis (making sure it goes to the right patient) It allows to add more parameters
+model_data <- as.data.frame(t(df_rel)) %>% 
+  rownames_to_column(var = "person_id") %>%
+  mutate(person_id = gsub("_debut","",person_id))%>% 
+  dplyr::inner_join(as.data.frame(colData(tse_filt))[,c("person_id","Diagnosis")],by = "person_id") %>%
+  column_to_rownames(var = "person_id") %>%
+  select(Diagnosis,everything())
+model_data
+```
+
+Data inspection
+```{r}
+table(model_data$Diagnosis)/length(model_data$Diagnosis)
+```
+The data has more converters than non-converters, which might overfit the classifier and bias it towards decting MS-converters. Lets try the simple version and see how it looks
+
+Once the  dataframe is created, the data will be split into training and test sets:
+```{r}
+set.seed(123)
+train_indices <- createDataPartition(model_data$Diagnosis, p = 0.7, list = FALSE)
+# Create train and test sets
+train_data <- model_data[train_indices, ]
+test_data <- model_data[-train_indices, ]
+```
+
+Now, lets train the model to detect MS
+```{r}
+set.seed(123)  # For reproducibility
+rf_model <- randomForest(Diagnosis ~ ., data = train_data)
+```
+
+And, lets test the model:
+```{r}
+predictions <- predict(rf_model, newdata = test_data)
+# confusion_matrix <- table(Actual = test_data$Diagnosis, Predicted = predictions)
+# metrics <- calculate_metrics(confusion_matrix)
+# print(metrics)
+confusionMatrix(predictions,test_data$Diagnosis)
+```
+
+Plotting the random forest
+```{r}
+plot(rf_model)
+```
+```{r}
+hist(treesize(rf_model),
+     main = "No. of Nodes for the Trees",
+     col = "green")
+```
+
+Variance importance
+```{r}
+
+varImpPlot(rf_model,
+           sort = T,
+           n.var = 10,
+           main = "Top 10 - Variable Importance")
+as.data.frame(importance(rf_model)) %>% arrange(desc(MeanDecreaseGini))
+
+```
+
+```{r}
+MDSplot(rf_model,train_data$Diagnosis)
+```
+
+### Modifying parameters
+
+Weights of the different groups
+```{r}
+weight <- table(train_data$Diagnosis)
+
+```
+
+```{r}
+rf_mod <- randomForest(Diagnosis ~ ., data = train_data,
+                       ntree = 800,
+                       sampsize = weight,
+                       strata = train_data$Diagnosis)
+```
+
+```{r}
+cv_res <- RF_trial(model_data,100)
+cv_res[[1]] %>% rownames_to_column(var = "Folds") %>% select(Folds,everything())
+# %>% 
+# writexl::write_xlsx("Only_metagenomics_RF.xlsx")
+```
+
+```{r}
+cv = 5
+cv_res[[1]][which.min(abs(cv_res[[1]][1:cv,"Accuracy"] - cv_res[[1]][cv+1,"Accuracy"])),"pvalue"]
+
+which.min(abs(cv_res[[1]][1:cv,"Accuracy"] - cv_res[[1]][cv+1,"Accuracy"]))
+abs(cv_res[[1]][1:cv,"Accuracy"] - cv_res[[1]][cv+1,"Accuracy"])
+```
+
+
+Trying with the new relative abundances
+```{r}
+df_nrel <- as.data.frame(assay(tse_filt,"relabundance"))[DA_sp,] #Direct subset of the DA species
+
+# Merge the Diagnosis (making sure it goes to the right patient) It allows to add more parameters
+new_data <- as.data.frame(t(df_nrel)) %>% 
+  rownames_to_column(var = "person_id") %>%
+  mutate(person_id = gsub("_debut","",person_id))%>% 
+  dplyr::inner_join(as.data.frame(colData(tse_filt))[,c("person_id","Diagnosis")],by = "person_id") %>%
+  column_to_rownames(var = "person_id") %>%
+  select(Diagnosis,everything())
+```
+
+```{r}
+new_res <- RF_trial(new_data,100)
+new_res[[1]] %>% rownames_to_column(var = "Folds") %>% select(Folds,everything()) %>% filter(Folds == "Average")
+```
+
+
+
+```{r}
+cv_res[[1]] %>% rownames_to_column(var="Fold") %>% filter(Fold != "Average") %>%
+  mutate_at(vars(Accuracy,Precision,Sensitivity,Specificity),funs(./100)) %>%
+  pivot_longer(-Fold) %>%
+  ggplot(aes(x= name, y = value)) +
+  geom_boxplot()
+  
+```
+
+Does not change anything. There are different values, sometimes it is a really good classifier and sometimes fails. My take is that the bacteria are not DA in all the patients of a group. Therefore, the classifier depends on a high degree on the training set that is being used. The fact that we have a small training and test set is one reason why we have this. Overfitting also influences.
+
+
+## Model v2 (All species)
+
+```{r}
+# Merge the Diagnosis (making sure it goes to the right patient) It allows to add more parameters
+md_2 <- as.data.frame(t(assay(tse_filt,"relabundance"))) %>% 
+  rownames_to_column(var = "person_id") %>%
+  dplyr::inner_join(as.data.frame(colData(tse_filt))[,c("person_id","Diagnosis")],by = "person_id") %>%
+  column_to_rownames(var = "person_id") %>%
+  select(Diagnosis,everything())
+
+stats_v2 <- RF_trial(md_2,100)
+stats_v2[[1]][101,]
+
+```
+It does not seem to improve the model anymore. Maybe increasing the data with the clinical parameters would work. However, is it the goal of the paper? Let's see if modifying the RF parameters, anything improves
+
+## Model v3 (Including all clinical data)
+
+Model that includes all the clinical data used in the FAMS analysis
+```{r}
+# Desired traits to include in the model
+traits <- NULL
+# Get relative abundance matrix of the DA species
+DA_sp <- rest %>% filter(padj < 0.01) %>%
+  select(row) %>% unlist
+df_rel <- as.data.frame(assay(tse_filt,"relabundance"))[DA_sp,] #Direct subset of the DA species
+
+# Fixing the metadata so it fits the model (Changing the character binaries to 0,1 and the diagnosis as factor)
+metadata_comp %>%
+  mutate_at(vars(OCB,brain_lesions,medulla_lesions,brain_contrast_lesions),funs(ifelse(str_detect(.,"no"),0,1))) %>%
+  mutate(Diagnosis = as.factor(Diagnosis))-> n_metadata_comp
+
+# Joining the model togehter
+md_3 <- as.data.frame(t(df_rel)) %>% 
+  rownames_to_column(var = "person_id") %>%
+  dplyr::inner_join(n_metadata_comp,by = "person_id") %>%
+  column_to_rownames(var = "person_id") %>%
+  select(Diagnosis,everything())
+
+# Running everything and outputting the summary statistics
+stats_v3 <- RF_trial(md_3,100)
+stats_v3[[1]][101,]
+```
+
+After including all of the clinical data, the model outperforms the one created only with the gut-microbiome data. Now, let's see how only the time dat works
+
+## Model v4 (only some parameters)
+
+The parameters that will be included will be those that are usually taken as markers for the diagnosis of MS. 
+
+```{r}
+# Desired traits to include in the model
+traits <- c("brain_lesions", "brain_contrast_lesions", "OCB", "CSF_WBC", "IgG_index")
+# Get relative abundance matrix of the DA species
+DA_sp <- rest %>% filter(padj < 0.01) %>%
+  select(row) %>% unlist
+df_rel <- as.data.frame(assay(tse_filt,"relabundance"))[DA_sp,] #Direct subset of the DA species
+
+# Fixing the metadata so it fits the model (Changing the character binaries to 0,1 and the diagnosis as factor)
+n_metadata_comp <- metadata_comp %>%
+  mutate_at(vars(OCB,brain_lesions,medulla_lesions,brain_contrast_lesions),funs(ifelse(str_detect(.,"no"),0,1))) %>%
+  mutate(Diagnosis = as.factor(Diagnosis)) %>%
+  select(person_id,Diagnosis,all_of(traits))
+
+# Joining the model togehter
+md_4 <- as.data.frame(t(df_rel)) %>% 
+  rownames_to_column(var = "person_id") %>%
+  dplyr::inner_join(n_metadata_comp,by = "person_id") %>%
+  column_to_rownames(var = "person_id") %>%
+  select(Diagnosis,everything())
+
+# Running everything and outputting the summary statistics
+stats_v4 <- RF_trial(md_4,100)
+stats_v4[[1]][101,]
+
+#stats_v4[[1]] %>% rownames_to_column(var = "Folds") %>% select(Folds,everything()) %>% 
+#writexl::write_xlsx("All_RF.xlsx")
+```
+
+Wow, the model seems to have a relaly similar parameters as before, only with these markers. Lets see how it would be without the metagenomics data and those parameters
+```{r}
+wilcox.test(stats_v4[[1]]$MCC,stats_v5[[1]]$MCC,
+            alternative = "greater")
+```
+One model, for plotting
+```{r}
+  set.seed(1) # Reproducibility
+  
+train_indices <- createDataPartition(md_4$Diagnosis, p = 0.7, list = FALSE)
+# Create train and test sets
+train_data <- md_4[train_indices, ]
+test_data <- md_4[-train_indices, ]
+# Train the model
+weight <- table(train_data$Diagnosis)
+rf_model <- randomForest(Diagnosis ~ ., data = train_data,
+                         ntree = 800,
+                         sampsize = weight,
+                         strata = train_data$Diagnosis)
+
+# Make the predictions
+predictions <- predict(rf_model, newdata = test_data)
+      
+#store the resultsr
+res <- calculate_metrics(test_data$Diagnosis,predictions)
+res
+```
+Variance importance
+```{r}
+
+varImpPlot(rf_model,
+           sort = T,
+           n.var = 10,
+           main = "Top 10 - Variable Importance")
+as.data.frame(importance(rf_model)) %>% arrange(desc(MeanDecreaseGini))
+
+```
+
+
+
+## Model v5 (only clinical paramters)
+
+```{r}
+traits <- c("brain_lesions", "brain_contrast_lesions", "OCB", "CSF_WBC", "IgG_index")
+# Create the new non-GM model
+md_5 <- metadata_comp %>%
+  mutate_at(vars(OCB,brain_lesions,medulla_lesions,brain_contrast_lesions),funs(ifelse(str_detect(.,"no"),0,1))) %>%
+  mutate(Diagnosis = as.factor(Diagnosis)) %>%
+  select(Diagnosis,traits)
+
+# Running everything and outputting the summary statistics
+stats_v5 <- RF_trial(md_5,100)
+stats_v5[[1]][101,]
+
+# stats_v5[[1]] %>% rownames_to_column(var = "Folds") %>% select(Folds,everything()) %>% 
+# writexl::write_xlsx("CP_RF.xlsx")
+```
+
+```{r}
+wilcox.test(stats_v4[[1]]$Sensitivity,stats_v5[[1]]$Sensitivity,
+            alternative = "greater")
+```
+
+## Model v6 (clinical + all bacteria)
+
+```{r}
+traits <- c("brain_lesions", "brain_contrast_lesions", "OCB", "CSF_WBC", "IgG_index")
+
+md_6 <- as.data.frame(t(assay(tse_filt,"relabundance"))) %>% 
+  rownames_to_column(var = "person_id") %>%
+  dplyr::inner_join(n_metadata_comp,by = "person_id") %>%
+  column_to_rownames(var = "person_id") %>%
+  select(Diagnosis,everything())
+
+stats_v6 <- RF_trial(md_6,100)
+stats_v6[[1]][101,]
+```
+
+```{r}
+  set.seed(1) # Reproducibility
+  
+train_indices <- createDataPartition(md_6$Diagnosis, p = 0.7, list = FALSE)
+# Create train and test sets
+train_data <- md_6[train_indices, ]
+test_data <- md_6[-train_indices, ]
+# Train the model
+weight <- table(train_data$Diagnosis)
+rf_model_6 <- randomForest(Diagnosis ~ ., data = train_data,
+                         ntree = 800,
+                         sampsize = weight,
+                         strata = train_data$Diagnosis)
+
+# Make the predictions
+predictions_6 <- predict(rf_model_6, newdata = test_data)
+      
+#store the resultsr
+res_6 <- calculate_metrics(test_data$Diagnosis,predictions_6)
+res_6
+```
+Variance importance
+```{r}
+
+varImpPlot(rf_model_6,
+           sort = T,
+           n.var = 10,
+           main = "Top 10 - Variable Importance")
+as.data.frame(importance(rf_model_6)) %>% arrange(desc(MeanDecreaseGini))
+
+```
+
+
+### Model comparison
+
+```{r}
+all_bact.df <- stats_v2[[1]][-101,] %>% mutate(type = "All GM")
+all_clin.df <- stats_v3[[1]][-101,] %>% mutate(type = "All clinical")
+clin_da.df <- stats_v4[[1]][-101,] %>% mutate(type = "Clinical + DA GM")
+clin.df <- stats_v5[[1]][-101,]  %>% mutate(type = "Clinical only")
+all_bact_clin.df <- stats_v6[[1]][-101,] %>% mutate(type = "All GM + clinical")
+da.df <- new_res[[1]][-101,] %>% mutate(type = "DA GM only")
+
+rbind(clin_da.df,clin.df,da.df) %>%
+  #select(-pvalue) %>%
+  mutate_at(vars(Accuracy,Precision,Sensitivity,Specificity),~(./100)) %>%
+  pivot_longer(-type,names_to = "Metric") %>%
+  mutate(Metric = factor(gsub("_"," ",Metric),
+                              levels = c("Accuracy","Precision","Sensitivity","Specificity","MCC","AUC ROC","F1 Score","pvalue")),
+         type = factor(type,
+                       levels=c("Clinical + DA GM","Clinical only","DA GM only"))
+         ) %>%
+  ggplot(aes(x = type, y = value, fill = type)) +
+  geom_boxplot(outlier.size = 0, alpha = 0.8) +
+  #geom_hline(yintercept=1, linetype = "dashed", color = "red") +
+  facet_grid(~Metric) +
+  stat_signif(comparisons = list(c("Clinical + DA GM","Clinical only")),
+              test = "t.test",
+              test.args = c(alternative = "greater"),
+              tip_length = 0,
+              map_signif_level = TRUE,
+              show.legend = TRUE) +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.background = element_rect(fill="#fad58a"),
+        legend.position = "bottom") +
+  labs(fill = "Dataset") +
+  scale_fill_manual(values = c("#28B463","#2E86C1","#CB4335")) +
+  scale_y_continuous(breaks = c(0,0.25,0.5,0.75,1),
+                     limits = c(0,1.1))
+
+
+ggsave("final_plots/Classifier_comparisons.png", dpi = 300)
+```
+
+```{r}
+rbind(clin_da.df,clin.df,da.df,all_bact.df,all_clin.df,all_bact_clin.df) %>%
+  #select(-pvalue) %>%
+  mutate_at(vars(Accuracy,Precision,Sensitivity,Specificity),~(./100)) %>%
+  pivot_longer(-type,names_to = "Metric") %>%
+  mutate(Metric = factor(gsub("_"," ",Metric),
+                              levels = c("Accuracy","Precision","Sensitivity","Specificity","MCC","AUC ROC","F1 Score","pvalue")),
+         type = factor(type,
+                       levels=c("Clinical + DA GM","Clinical only","DA GM only","All GM","All clinical","All GM + clinical"))
+         ) %>%
+  ggplot(aes(x = type, y = value, fill = type)) +
+  geom_boxplot(outlier.size = 0, alpha = 0.8) +
+  facet_grid(~Metric) +
+  # stat_signif(comparisons = list(c("Clinical + GM","Clinical only")),
+  #             test = "t.test",
+  #             test.args = c(alternative = "greater"),
+  #             tip_length = 0,
+  #             map_signif_level = TRUE,
+  #             show.legend = TRUE) +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.background = element_rect(fill="#fad58a"),
+        legend.position = "bottom") +
+  labs(fill = "Dataset") +
+  ylim(0,NA)
+
+ggsave("final_plots/Sup/All_classifier_comparisons.png", dpi = 300)
+```
+
+
+As can be seen, this parameters result in better precision, specificity and AUC than the mixed model with the GM. However, the accuracy and MCC are slightly better in the GM model.
+
+```{r}
+avg.df <- rbind(stats_v4[[1]][101,],stats_v5[[1]][101,],new_res[[1]][101,])
+rownames(avg.df) <- c("Clinical + microbiome","Clinical only","Microbiome only")
+avg.df
+```
+
+ 
+
+
+## CV trial functions
+```{r}
+RF_trial <- function(df, cv = 1,p_var = "Diagnosis"){
+  set.seed(123) # Reproducibility
+  
+  # Creation of the result variables
+  cv_results <- list() # To store the cv results
+  c_mats <- list() # To store the matrices
+  stats <- list()
+  
+  # Perform the cross-validation iterations
+    for (fold in 1:cv){
+      train_indices <- createDataPartition(df[,p_var], p = 0.7, list = FALSE)
+      # Create train and test sets
+      train_data <- df[train_indices, ]
+      test_data <- df[-train_indices, ]
+      # Train the model
+      weight <- table(train_data[,p_var])
+      rf_model <- randomForest(Diagnosis ~ ., data = train_data,
+                               ntree = 800,
+                               sampsize = weight,
+                               strata = train_data[,p_var])
+  
+      # Make the predictions
+      predictions <- predict(rf_model, newdata = test_data)
+      
+      #store the results
+      cv_results[[fold]] <- calculate_metrics(test_data[,p_var],predictions)
+      stats[[fold]] <- confusionMatrix(predictions,test_data[,p_var])
+    }
+    # Conversion of the self made metrics into a data frame
+    df <- as.data.frame(do.call(rbind, cv_results)) %>%
+    mutate_at(vars(Accuracy,Precision,Sensitivity,Specificity,MCC,F1_Score,AUC_ROC,pvalue), ~ as.numeric(.))
+  df <- bind_rows(df, colMeans(df, na.rm = TRUE)) 
+  
+  # Assign row names
+  row_names <- c(paste("Fold", 1:(nrow(df) - 1)), "Average")
+  rownames(df) <- row_names
+  
+  # Get the pvalue for the average accuracy that gets the closest to it
+  df["Average","pvalue"] <- df[which.min(abs(df[1:cv,"Accuracy"] -df[cv+1,"Accuracy"])),"pvalue"]
+  
+  
+  
+  
+  
+    if (cv == 1){
+      return(list(df,unlist(stats)))
+    } else {
+        return(list(df,stats))
+    }
+}
+```
+
+Old function
+```{r}
+RF_old <- function(df, cv = 1){
+set.seed(123) # Reproducibility
+# Creation of the result variables
+cv_results <- list() # To store the cv results
+c_mats <- list() # To store the matrices
+stats <- list()
+# Perform the cross-validation iterations
+  for (fold in 1:cv){
+    train_indices <- createDataPartition(df$Diagnosis, p = 0.7, list = FALSE)
+    # Create train and test sets
+    train_data <- df[train_indices, ]
+    test_data <- df[-train_indices, ]
+    # Train the model
+    weight <- table(train_data$Diagnosis)
+    rf_model <- randomForest(Diagnosis ~ ., data = train_data,
+                             ntree = 800,
+                             sampsize = weight,
+                             strata = train_data$Diagnosis)
+    # Make the predictions
+    predictions <- predict(rf_model, newdata = test_data)
+    
+    #store the results
+    cv_results[[fold]] <- calculate_metrics(test_data$Diagnosis,predictions)
+    stats[[fold]] <- confusionMatrix(predictions,test_data$Diagnosis)
+  }
+  # Conversion of the self made metrics into a data frame
+  df <- as.data.frame(do.call(rbind, cv_results)) %>%
+  mutate_at(vars(Accuracy,Precision,Sensitivity,Specificity,MCC,F1_Score,AUC_ROC,pvalue), ~ as.numeric(.))
+df <- bind_rows(df, colMeans(df, na.rm = TRUE)) 
+  # Assign row names
+row_names <- c(paste("Fold", 1:(nrow(df) - 1)), "Average")
+rownames(df) <- row_names
+
+  if (cv == 1){
+    return(list(df,unlist(stats)))
+  } else {
+      return(list(df,stats))
+  }
+}
+```
+
+
+## Metrics functions
+```{r}
+table(Actual = test_data$Diagnosis,Predicted = predictions)
+
+```
+
+### Obtain metrics
+```{r}
+calculate_metrics <- function(actual,preds) {
+  conf_matrix <- table(Actual = actual,Predicted = preds)
+  cM <- confusionMatrix(preds,actual)
+  # Getting the different values
+  TP <- conf_matrix[1, 1]
+  FN <- conf_matrix[1, 2]
+  FP <- conf_matrix[2, 1]
+  TN <- conf_matrix[2, 2]
+  # Metric 1: Accuracy
+  accuracy <- (TP + TN) / sum(conf_matrix)
+  
+  # MCC
+  m <- matrix(c(conf_matrix[1,1],conf_matrix[1,2],
+         conf_matrix[2,1],conf_matrix[2,2]),
+         nrow=2)
+  mcc.r <- mcc(confusionM = m)
+
+  # Metric 2: Precision
+  precision <- TP / (TP + FP)
+
+  # Metric 3: Recall (Sensitivity)
+  recall <- TP / (TP + FN)
+
+  # Metric 4: Specificity
+  specificity <- TN / (TN + FP)
+
+  # Metric 5: F1 Score
+  f1_score <- 2 * (precision * recall) / (precision + recall)
+
+  # Metric 9: AUC-ROC
+  roc_obj <- roc(as.factor(actual), as.numeric(preds == "MS-converter"))
+  auc_roc <- auc(roc_obj)
+
+
+  # Create a list of metrics
+  metrics <- list(
+    Accuracy = round(accuracy*100,0),
+    Precision = round(precision*100,0),
+    Sensitivity = round(recall*100,0),
+    Specificity = round(specificity*100,0),
+    MCC = round(mcc.r,2),
+    F1_Score = round(f1_score,2),
+    AUC_ROC = round(auc_roc,2),
+    pvalue = round(cM$overall["AccuracyPValue"],4)
+  )
+
+  return(metrics)
+}
+```
+
+### CV metrics summary
+
+```{r}
+
+df
+
+# Calculate mean and standard deviation
+mean_values <- apply(df, 2, function(x) mean(as.numeric(x), na.rm = TRUE))
+sd_values <- apply(df, 2, function(x) sd(as.numeric(x), na.rm = TRUE)) 
+
+
+# Add mean and standard deviation as the final row
+df_mean_sd <- rbind(df, mean_values)
+df_mean_sd[nrow(df_mean_sd), ] <- paste0(
+  format(df_mean_sd[nrow(df_mean_sd), ], nsmall = 0, digits = 0), 
+  " (",
+  format(sd_values, nsmall = 2, digits = 0),
+  ")"
+)
+
+# Assign row names
+row_names <- c(paste("Fold", 1:(nrow(df) - 1)), "Average")
+rownames(df) <- row_names
+df
+# Print the dataframe
+print(df_mean_sd)
+```
+```{r}
+actual_labels <- c(rep("MS-converter", 13), rep("non-converter", 9))
+
+# Create a vector of predicted probabilities for the positive class
+predicted_probs <- c(rep(1, 13), rep(0, 5), rep(0, 4))
+length(predicted_probs)
+length(actual_labels)
+# Calculate the AUC-ROC
+roc_obj <- roc(actual_labels, predicted_probs)
+auc_roc <- auc(roc_obj)
+auc_roc
+```
+
+
+# Supplementary plots
+
+## FAMD vectors
+
+Quantitative variables
+```{r}
+fviz_famd_var(famd.res, "quanti.var", repel = TRUE,
+              col.var = "black",
+              labelsize = 2,
+              arrowsize = 0.25) +
+  theme_bw() +
+  theme(text = element_text(size=6,
+                            family = "serif"),
+        title = element_blank(),
+        legend.key.width = unit(0.4,"cm")) +
+  labs(color = "Contribution")
+
+ggsave("final_plots/Sup/FAMD_quant_var.png",,width = 2, height = 2,dpi = 300)
+```
+
+```{r}
+fviz_famd_var(famd.res, "quali.var", col.var = "contrib", repel = TRUE,
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             labelsize = 2,
+             pointsize = 0.7) +
+  theme_bw() +
+  theme(text = element_text(size=6,
+                            family = "serif"),
+        title = element_blank(),
+        legend.key.width = unit(0.4,"cm")) +
+  labs(color = "Contribution")
+
+ggsave("final_plots/Sup/FAMD_quali_var.png",width = 2, height = 2,dpi = 300)
+```
+
+
+```{r}
+fviz_famd_var(famd.res, col.var = "contrib", repel = TRUE,
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             labelsize = 2,
+             pointsize = 0.7)
+```
+
+
+
+## Library size
+
+```{r}
+library(ggpubr)
+as.data.frame(colData(tse_bs)) %>%
+  mutate(Rarefied = 4.2e7,
+         Metaphlan = sum) %>%
+  pivot_longer(cols=c('Raw_reads','Fastp_filtered','Bowtie',"Rarefied",'Metaphlan'),names_to = 'Process',values_to='reads') %>%
+  mutate(Process = gsub("_"," ",Process)) %>%
+  ggplot(aes(x=factor(Process,
+                      level=c('Raw reads','Fastp filtered', 'Bowtie', "Rarefied", 'Metaphlan')),
+             y=reads/1e6,)
+         ) +
+  geom_boxplot(aes(fill = Diagnosis),
+               outlier.size = 0.5
+               ) +
+  geom_signif(annotation = c("NS")
+              ) +
+  theme_bw() +
+  labs(x ='Process',
+       y = expression(Reads[(M)])
+       ) +
+  ylim(0,55) +
+  theme(text = element_text(size = 7,
+                              family = "serif")) +
+  scale_fill_manual(values = m.color) 
+
+ggsave("final_plots/Sup/Reads_per_step.png",width=4,height=3,dpi = 300)
+```
+
+
+## Rarefaction
+
+Library size effect
+```{r}
+frich.df %>% ggplot(aes(x=as.numeric(size),y=richness,color=id)) +
+  geom_point(size = 1) + 
+  geom_line() +
+  theme_bw() +
+  theme(text = element_text(size = 15,
+                            family = "serif"),
+        legend.position = "none",) +
+  labs(x = "Library size",
+      y = expression(Richness[observed]))
+
+ggsave("final_plots/Sup/Rarefaction_curve.png",width = 4, height = 3,dpi = 300)
+```
+
+Difference in richness with test
+
+```{r}
+n1 <- frich.df %>% head(n=20) %>% mutate(size = "Original") %>% select(richness,size)
+n2 <- as.data.frame(colData(tse_bs)) %>% mutate(size = "Rarefied",richness = observed) %>% select(richness,size)
+
+rbind(n1,n2) %>%
+  ggplot(aes(x=as.factor(size),y=richness,fill = size)) +
+  geom_boxplot() +
+  geom_signif(comparisons = list(c("Original","Rarefied")),
+              test = "t.test",
+              tip_length = 0,
+              y_position = 425,
+              textsize = 4) +
+  theme_bw() +
+  ylim(150,450) +
+  labs(x = NULL,
+       y = expression(Richness[Observed])) +
+  scale_fill_manual(values = c("#F8C471","#58D68D")) +
+  theme(text = element_text(size=15,
+                            family = "serif"),
+        legend.position = "None")
+  
+ggsave("final_plots/Sup/Rarefaction_diff.png",width = 4, height = 3,dpi = 300)
+```
+```{r} 
+n1 <- frich.df %>% head(n=20) %>% mutate(size = "Original") %>% select(richness,size)
+n2 <- as.data.frame(colData(tse_bs)) %>% mutate(size = "Rarefied",richness = observed) %>% select(richness,size)
+n1
+n2
+rbind(n1,n2) %>%
+  ggplot(aes(x=size,y=richness,color=size)) +
+  geom_boxplot()
+```
+
+## Rare taxa filtering
+```{r}
+tse_sp <- tse[!is.na(rowData(tse)$Species) & is.na(rowData(tse)$Strain),tse$disease_group == "ON_debut" & !is.na(tse$Diagnosis)]
+```
+
+Phyllum 
+```{r}
+# Produce the abundance plots. Diagnosis will be the feature in which the plot is orderder
+plot_filt <- plotAbundance(tse_filt, assay_name="relabundance",rank="Phylum",order_rank_by = "abund", order_sample_by = "Diagnosis")
+plot_sp <-  plotAbundance(tse_sp, assay_name="relabundance",rank="Phylum",order_rank_by = "abund", order_sample_by = "Diagnosis")
+
+plots <- list(plot_sp + 
+                theme(text = element_text(size = 10, family = "serif"),
+                      legend.key.size = unit(0.3,"cm")) +
+                ggtitle("Unfiltered") ,
+              plot_filt + 
+                ggtitle("Filtered") + 
+                theme(text = element_text(size = 10, family = "serif"),
+                      legend.key.size = unit(0.5,"cm") )) # Reorder plots
+wrap_plots(plots, ncol = 2)
+ggsave("final_plots/Sup/rareFilt_phylum_relabund.png",width=7,height = 4, dpi = 300)
+```
+
+
+Alpha diversity
+```{r}
+df.n <- as.data.frame(colData(tse_bs)) %>% select(faith) %>% mutate(type = "Unfiltered")
+df.f <- as.data.frame(colData(tse_filt)) %>% select(faith) %>% mutate(type = "Filtered")
+
+df <- rbind(df.n,df.f)
+
+df$type <- factor(df$type,levels = unique(df$type))
+df %>%
+  ggplot(aes(x = type, y = faith, color = type)) +
+  geom_violin(fill = "#F1F1F1",color = "gray",alpha = 0.5) +
+  ggbeeswarm::geom_quasirandom(size = 1.5) +
+  theme_bw() +
+  geom_signif(comparisons = list(c("Filtered","Unfiltered")), 
+              map_signif_level = FALSE,
+              color = "black",
+              textsize = 5,
+              tip_length = 0,
+              test = "wilcox.test",
+              test.args = c(exact = FALSE)) + 
+  theme(text = element_text(size = 25,
+                            family = "serif"),
+        legend.position = "None",
+        axis.title.x = element_blank()) +
+  labs(#title = "Shannon index for the ON patients",
+       y = "Faiths' PD") +
+  scale_color_manual(values = c("#F8C471","#58D68D")) +
+  ylim(0,145)
+
+ggsave("final_plots/Sup/rareFilt_FPD.png",width=4,height=4)
+```
+
+Beta-diversity
+
+
+```{r}
+# Explained variance for each axis
+e <- attr(reducedDim(tse_bs, "PCoA_CB"), "eig");
+rel_eig <- e/sum(e[e>0])      
+# Extracting the Principal components for the reduction of the Canberra Distance
+df <- as.data.frame(reducedDim(tse_bs, "PCoA_CB"))
+colnames(df) <- c("PC1","PC2")
+df <- cbind(df,"Diagnosis" = tse_bs$Diagnosis) 
+
+pu <- df %>%
+  ggplot(aes(x=PC1,y=PC2,color=Diagnosis)) +
+  geom_point(size = 0.5) +
+  stat_ellipse(aes(fill = Diagnosis),
+               geom = "polygon",
+               alpha = 0.2) +
+  theme_bw() +
+  labs(title = "Unfiltered",
+              # x = paste("PCoA 1 (", round(100 * rel_eig[[1]],1), "%", ")", sep = ""),
+              # y = paste("PCoA 2 (", round(100 * rel_eig[[2]],1), "%", ")", sep = "")
+       ) +
+  theme(text = element_text(size = 12,
+                            family = "serif"),
+        legend.title = element_blank(),
+        legend.position = "bottom") +
+  scale_fill_manual(values = m.color) +
+  scale_color_manual(values = m.color)
+
+# Explained variance for each axis
+e <- attr(reducedDim(tse_filt, "PCoA_CB"), "eig");
+rel_eig <- e/sum(e[e>0])      
+# Extracting the Principal components for the reduction of the Canberra Distance
+df <- as.data.frame(reducedDim(tse_filt, "PCoA_CB"))
+colnames(df) <- c("PC1","PC2")
+df <- cbind(df,"Diagnosis" = tse_bs$Diagnosis) 
+
+pf <- df %>%
+  ggplot(aes(x=PC1,y=PC2,color=Diagnosis)) +
+  geom_point(size = 0.5) +
+  stat_ellipse(aes(fill = Diagnosis),
+               geom = "polygon",
+               alpha = 0.2) +
+  theme_bw() +
+  labs(title = "Filtered",
+              # x = paste("PCoA 1 (", round(100 * rel_eig[[1]],1), "%", ")", sep = ""),
+              # y = paste("PCoA 2 (", round(100 * rel_eig[[2]],1), "%", ")", sep = "")
+       ) +
+  theme(text = element_text(size = 12,
+                            family = "serif"),
+        legend.title = element_blank(),
+        legend.position = "bottom") +
+  scale_fill_manual(values = m.color) +
+  scale_color_manual(values = m.color)
+
+pu + pf + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+
+ggsave("final_plots/Sup/rareFilt_PCoA.png",width=4,height=4,dpi=300)
+```
+
+
+## Clustering based on the DE taxa
+
+
+Now, the patients are going to be clustered based only in the differentialy abundant taxa, taken from the results of DESeq. For a species to be differentially expressed, the pvalue has to be under the threshold of significance of 0.01.These species will be selected to use as reference for the heatmap using the clr-z values.
+
+```{r}
+de_sp <- rest %>% filter(padj < 0.01) %>% select(row) %>% unlist()
+tse_hm <- tse_filt[rownames(tse_filt) %in% de_sp,]
+tse_hm
+```
+
+```{r}
+tse_hm <- transformCounts(tse_hm, assay_name = "counts",
+                              method = "relabundance",
+                              name = "pseudorel",
+                              pseudocount = 1)
+
+tse_hm <- transformCounts(tse_hm,
+                  assay_name = "pseudorel",
+                  method = "clr")
+
+# Add z-transformation on features (taxa)
+tse_hm <- mia::transformFeatures(tse_hm, assay_name = "clr",
+                              method = "z", name = "clr_z")
+```
+
+```{r}
+matrix <- as.matrix(assay(tse_hm,"clr_z"))
+metadata <- as.data.frame(colData(tse_hm))
+
+annotation_col = data.frame(
+    Diagnosis = metadata$Diagnosis, 
+    check.names = FALSE
+)
+rownames(annotation_col) = rownames(metadata)
+
+ann_colors = list(
+    Diagnosis = c(`MS-converter` = "red", `non-converter` = "blue")
+)
+
+ComplexHeatmap::pheatmap(matrix, scale= "none", 
+                         annotation_col = annotation_col,
+                         annotation_colors = ann_colors,
+                         fontsize_row = 3,
+                         fontsize_col = 3)
+```
+
+
+```{r}
+df <- meltAssay(tse_hm, assay_name = "clr_z")
+df <- as.data.frame(colData(tse_hm)) %>% rownames_to_column(var = "SampleID") %>% dplyr::left_join(df,by = "SampleID") 
+
+# Getting a list of the patients that have data both at baseline and Follow-up
+pt <- df %>% dplyr::select(SampleID) %>% 
+  unique() %>% 
+  separate(SampleID,c("pt","time")) %>% 
+  dplyr::select(pt) %>% unlist()
+
+df <- df %>% filter(person_id %in% pt) %>% select(person_id,Diagnosis,FeatureID,clr_z) %>% arrange(Diagnosis)
+
+# Determines the scaling of colours
+maxval <- round(max(abs(df$clr_z)))
+limits <- c(-maxval, maxval)
+breaks <- seq(from = min(limits), to = max(limits), by = 0.5)
+colours <- c("darkblue", "blue", "white", "red", "darkred")
+
+df$person_id <- factor(df$person_id,levels=unique(df$person_id))
+
+# Creates a ggplot object
+ggplot(df, aes(x = person_id, y = FeatureID, fill = clr_z)) +
+  geom_tile() +
+  scale_fill_gradientn(name = "CLR + Z transform", 
+                       breaks = breaks, limits = limits, colours = colours) + 
+  theme(text = element_text(size=30),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        legend.position = "right") +
+  labs(x = "Samples", y = "Taxa",
+       title = "MS-converters at baseline")
+
+#ggsave("ON_baseline_DE_heatmap.png",width = 30, height = 20, dpi = 300)
+```
+
+It does not seem to be any kind of differences between both groups. Now lets plot the realtive abundances only:
+
+```{r,fig.width=20}
+df <- meltAssay(tse_hm, assay_name = "relabundance")
+df <- as.data.frame(colData(tse_hm)) %>% rownames_to_column(var = "SampleID") %>% dplyr::left_join(df,by = "SampleID") 
+
+# Getting a list of the patients that have data both at baseline and Follow-up
+pt <- df %>% dplyr::select(SampleID) %>% 
+  unique() %>% 
+  separate(SampleID,c("pt","time")) %>% 
+  dplyr::select(pt) %>% unlist()
+
+df <- df %>% filter(person_id %in% pt) %>% select(person_id,Diagnosis,FeatureID,relabundance) %>% arrange(Diagnosis)
+
+# Determines the scaling of colours
+maxval <- round(max(abs(df$relabundance)))
+limits <- c(-maxval, maxval)
+breaks <- seq(from = min(limits), to = max(limits), by = 0.5)
+colours <- c("darkblue", "blue", "white", "red", "darkred")
+
+df$person_id <- factor(df$person_id,levels=unique(df$person_id))
+
+# Creates a ggplot object
+ggplot(df, aes(x = person_id, y = FeatureID, fill = relabundance)) +
+  geom_tile() +
+  theme(text = element_text(size=20),
+        axis.text.x = element_text(angle=90,size=5),
+        legend.position = "right") +
+  labs(x = "Samples", y = "Taxa",
+       title = "MS-converters at baseline")
+```
+
+
+
+
+# Random forest based on the Oligoclonal bands
+
+In this case, let's modify the RF classifier so it predicts the presence of Oligoclonal bands
+```{r}
+
+# Get relative abundance matrix of the DA species
+DA_sp <- rest %>% filter(padj < 0.01) %>%
+  select(row) %>% unlist
+df_rel <- as.data.frame(assay(tse_filt,"new_rel"))[DA_sp,] #Direct subset of the DA species
+
+# Fixing the metadata so it fits the model (Changing the character binaries to 0,1 and the diagnosis as factor)
+n_metadata_comp <- metadata_comp %>%
+  mutate(OCB = as.factor(OCB)) %>%
+  select(person_id,OCB)
+
+# Joining the model togehter
+md_ocb <- as.data.frame(t(df_rel)) %>% 
+  rownames_to_column(var = "person_id") %>%
+  dplyr::inner_join(n_metadata_comp,by = "person_id") %>%
+  column_to_rownames(var = "person_id") %>%
+  select(OCB,everything())
+md_ocb
+```
+
+```{r}
+set.seed(123) # Reproducibility
+cv = 100
+# Creation of the result variables
+cv_results <- list() # To store the cv results
+c_mats <- list() # To store the matrices
+stats <- list()
+
+# Perform the cross-validation iterations
+for (fold in 1:cv){
+  train_indices <- createDataPartition(md_ocb$OCB, p = 0.7, list = FALSE)
+  # Create train and test sets
+  train_data <- md_ocb[train_indices, ]
+  test_data <- md_ocb[-train_indices, ]
+  # Train the model
+  weight <- table(train_data$OCB)
+  rf_model <- randomForest(OCB ~ ., data = train_data,
+                           ntree = 800,
+                           sampsize = weight,
+                           strata = train_data$OCB)
+
+  # Make the predictions
+  predictions <- predict(rf_model, newdata = test_data)
+  
+  #store the results
+  cv_results[[fold]] <- calculate_metrics(test_data$OCB,predictions)
+  }
+  # Conversion of the self made metrics into a data frame
+df <- as.data.frame(do.call(rbind, cv_results)) %>%
+  mutate_at(vars(Accuracy,Precision,Sensitivity,
+                 Specificity,MCC,F1_Score,AUC_ROC,pvalue), 
+            ~ as.numeric(.))
+
+df <- bind_rows(df, colMeans(df, na.rm = TRUE)) 
+
+# Assign row names
+row_names <- c(paste("Fold", 1:(nrow(df) - 1)), "Average")
+rownames(df) <- row_names
+
+# Get the pvalue for the average accuracy that gets the closest to it
+df["Average","pvalue"] <- df[which.min(abs(df[1:cv,"Accuracy"] -df[cv+1,"Accuracy"])),"pvalue"]
+
+```
+
+Results:
+```{r}
+df["Average",]
+colnames(colData(tse_filt))
+rownames(tse_filt)[str_detect(rownames(tse_filt),"sak")]
+```
+
+
+```{r}
+
+as.data.frame(t(assay(tse_filt,"relabundance"))) %>%
+  rownames_to_column(var = "person_id") %>%
+  dplyr::inner_join(as.data.frame(colData(tse_filt)),by = "person_id") -> all.df
+  all.df %>%
+  filter(Fecal_sample_ON_days < 50 & Prevotella_copri_clade_C != 0) %>%
+  ggplot(aes(y=Prevotella_copri_clade_C,x = Fecal_sample_ON_days,color = Diagnosis)) +
+  geom_point() +
+  geom_smooth(method="lm")
+```
+
+```{r}
+
+
+columns_to_test <- rest %>% filter(padj < 0.01 & log2FoldChange > 0) %>% select(row) %>% unlist
+
+test.var <- "CSF_WBC"
+
+# Create an empty data frame to store the results
+results_df <- data.frame(Species = character(),
+                         Comparison = character(),
+                         Diagnosis = character(),
+                         Slope = numeric(),
+                         R2 = numeric(),
+                         stringsAsFactors = FALSE)
+
+
+
+# Loop through each column and perform linear regression for each diagnosis group
+for (column in columns_to_test) {
+  # Filter data for MS-converters and calculate regression
+  ms_converters <- all.df %>% filter(Diagnosis == "MS-converter" &)
+
+  # Filter data for non-converters and calculate regression
+  non_converters <- all.df %>% filter(Diagnosis == "non-converter" )
+  
+  # Sanity check in case there is an empty group
+  if (nrow(ms_converters)  <= 2){
+    ms_slope = 0
+    ms_r2 = 0
+  } else {
+    ms_reg <- lm(ms_converters[[test.var]] ~ ms_converters[[column]])
+    ms_slope = summary(ms_reg)$coefficients[2,1]
+    ms_r2 = summary(ms_reg)$r.squared
+  }
+  if (nrow(non_converters) <= 2){
+    non_slope = 0
+    non_r2 = 0
+  } else {
+    non_reg <- lm(non_converters[[test.var]] ~ non_converters[[column]])
+    non_slope = summary(non_reg)$coefficients[2,1]
+    non_r2 = summary(non_reg)$r.squared
+  }
+  
+  # Append the results to the final data frame
+  results_df <- rbind(results_df,
+        data.frame(Species = c(column,column),
+                   Comparison = test.var,
+                   Diagnosis = c("MS-converter", "non-converter"),
+                   Slope = c(ms_slope, non_slope),
+                   R2 = c(ms_r2, non_r2)))
+}
+
+results_df %>% arrange(desc(R2))
+```
+
+
+# Rare taxa filtering
+
+## Alpha diversity
+```{r}
+a.df <- rbind(cbind("Faith" = as.numeric(colData(tse_filt)$faith),
+                            "Type" = "Filtered"),
+              cbind("Faith" = as.numeric(colData(tse_bs)$faith),
+                            "Type" = "Unfiltered"))
+
+
+as.data.frame(a.df) %>% mutate(Faith = as.numeric(Faith)) %>% 
+  ggplot(aes(x=Type, y=Faith ,color = Type)) +
+  geom_violin(fill = "#F1F1F1",color = "gray",alpha = 0.5) +
+  ggbeeswarm::geom_quasirandom(size = 3) +
+  geom_signif(comparisons = list(c("Filtered","Unfiltered")), 
+              map_signif_level = FALSE,
+              tip_length = 0,
+              textsize = 5,
+              y_position = 120,
+              color = "black",
+              test = "var.test",
+              test.args = c(exact = FALSE)) +
+  theme_bw() +
+  theme(
+         text = element_text(size = 20),
+        # axis.text = element_text(size = 30),
+        legend.position = "None") +
+  labs(title = "Richness comparison"
+       ,y = "Faith PD",
+       x = NULL) +
+  scale_color_manual(values = c("#58D68D","#F8C471"))  +
+  ylim(0,130)
+
+ggsave("../Presentation/Images/RareFilt_aD.png")
+```
+
+## Beta diversity
+
+```{r}
+# Explained variance for each axis
+e <- attr(reducedDim(tse_bs, "PCoA_CB"), "eig");
+rel_eig <- e/sum(e[e>0])      
+n.df <- as.data.frame(reducedDim(tse_bs, "PCoA_CB"))
+colnames(n.df) <- c("PC1","PC2")
+n.df <- cbind(n.df,"Diagnosis" = tse_bs$Diagnosis) 
+
+n.df %>%
+  ggplot(aes(x=PC1,y=PC2,color=Diagnosis)) +
+  geom_point(size = 0.5) +
+  stat_ellipse(aes(fill = Diagnosis),
+               geom = "polygon",
+               alpha = 0.1) +
+  theme_bw() +
+  labs(title = "Unfiltered data-set",
+              x = paste("PC 1 (", round(100 * rel_eig[[1]],1), "%", ")", sep = ""),
+              y = paste("PC 2 (", round(100 * rel_eig[[2]],1), "%", ")", sep = ""),
+       fill = "Groups:",
+       color = "Groups:") +
+  theme(text = element_text(family = "serif"),
+        legend.position = "bottom") +
+  scale_fill_manual(values = m.color) +
+  scale_color_manual(values = m.color)
+
+ggsave("../Presentation/Images/RareFilt_bD_unfiltered.png")
+
+```
+```{r}
+# Explained variance for each axis
+e <- attr(reducedDim(tse_filt, "PCoA_CB"), "eig");
+rel_eig <- e/sum(e[e>0])      
+f.df <- as.data.frame(reducedDim(tse_filt, "PCoA_CB"))
+colnames(f.df) <- c("PC1","PC2")
+f.df <- cbind(f.df,"Diagnosis" = tse_filt$Diagnosis) 
+
+f.df %>%
+  ggplot(aes(x=PC1,y=PC2,color=Diagnosis)) +
+  geom_point(size = 0.5) +
+  stat_ellipse(aes(fill = Diagnosis),
+               geom = "polygon",
+               alpha = 0.1) +
+  theme_bw() +
+  labs(title = "Filtered data-set",
+              x = paste("PC 1 (", round(100 * rel_eig[[1]],1), "%", ")", sep = ""),
+              y = paste("PC 2 (", round(100 * rel_eig[[2]],1), "%", ")", sep = ""),
+       fill = "Groups:",
+       color = "Groups:") +
+  theme(text = element_text(family = "serif"),
+        legend.position = "bottom") +
+  scale_fill_manual(values = m.color) +
+  scale_color_manual(values = m.color) 
+
+ggsave("../Presentation/Images/RareFilt_bD_filtered.png")
+```
+
+
+
+
+
+
+
+
+
+
