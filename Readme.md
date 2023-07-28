@@ -8,4 +8,4 @@ The main pipeline consists of an initial preprocessing of the raw fastq files us
 
 ## 2. MetaPhlAn pipeline
 
-  Metaphlan is run with an option to output the absolute counts. Custom scripts were used to correctly assign the patients IDs to each of the samples, and to produce a table that contained the absolute counts. Metaphlan's basic output of relative counts was merged using the already exiting metaphlan's scripts
+  Metaphlan is run with an option to output the absolute counts. Custom scripts were used to correctly assign the patients IDs to each of the samples, and to produce a table that contained the absolute counts. Metaphlan's basic output of relative counts was merged using the already exiting metaphlan's scripts. Another [script](https://forum.biobakery.org/t/merge-metaphlan-tables-py-with-absolute-abundance/1839) by timmyerg was used to extract and merge into one table the absolute counts for the OTUs. All the outputs from Metaphlan were analysed using R.
