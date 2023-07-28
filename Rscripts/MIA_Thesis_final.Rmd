@@ -40,11 +40,64 @@ control_scale <- c("#336699","#6699CC", "#99CCFF")
 ```
 
 
-```{r}
-table(colData(tse_filt)[tse_filt$Fecal_sample_ON_days < 45,"Diagnosis"])/nrow(colData(tse_filt)[tse_filt$Fecal_sample_ON_days < 45,"Diagnosis"])
-```
-
 # Data loading
+
+ The data can be loaded from the RData files, but also a initial set up is included.
+## Loading MetaPhlAn's data
+
+Metaphlan output is produced as a relative abundance table with all the samples. It has to be modified so it can be used as input for [Morten's pipeline](https://mortenarendt.github.io/MicrobiomeDataAnalysis/index.html), which uses phyloseq package mainly. A guide on the basics of metagenomcis data objects can be found [here](https://microbiome.github.io/OMA/index.html).
+
+The whole metaphlan output will be converted first to a phyloseq object and then to a tse object, to be manipulated by the miaverse. This way, several alternative experiments will be created, with different taxonomic levels and selected groups
+
+The idea of the modification comes from this [thread](https://www.biostars.org/p/449688/)
+
+```{r}
+# Loading count matrix (absolute values)
+mph.df <- read.csv("data/all_final_abs.txt", sep = "\t", strip.white = T, 
+                   stringsAsFactors = F, row.names = 1)
+tax.df <- mph.df %>% dplyr:: select(clade_taxid)
+mph.df <- mph.df %>% dplyr::select(-clade_taxid)
+
+# Eliminating the extra part of the names caused by the file naming
+colnames(mph.df) <- gsub('_profiled_metagenome','',colnames(mph.df)) 
+
+# Loading count matrix (relative values)
+rel.df <- read.csv("data/all_final_rel.txt",sep = "\t", strip.white = T,
+                   stringsAsFactors = F,row.names = 1)
+colnames(rel.df) <- gsub("d_metagenome","",colnames(rel.df))
+
+
+# Loading metadata and cleaning
+metadata <- read_xlsx("../Patients_data/All_patients_data.xlsx") %>% filter(!duplicated(sample_id)) %>%
+  dplyr::inner_join(og_groups,by="Sample")
+ 
+
+# Creating a metadata df with with the group information
+sample <- metadata %>% dplyr::select(-sample_id) %>% sample_data() # Creation of sample data object for phyloseq
+rownames(sample) <- metadata$sample_id # The sample names disapear, so they have to be manually added
+
+#Conversion of the metaphlan data into a phyloseq object:
+ps_mia.obj = metaphlanToPhyloseq(mph.df, metadat = sample) 
+rel_mia.obj = metaphlanToPhyloseq(rel.df)
+```
+## Conversion into a MIA object 
+
+Converting the phyloseq data into a [mia object](https://microbiome.github.io/OMA/index.html). The format used is called Tree Summarized Experiment (TSE). Different assays can be included, where the count data can be transformed. To begin with, only the total counts are present, bur it could be done with the relative abundance. To avoid issues during the quality check, all the steps will be done with the tse filtered to keep only species.
+
+```{r}
+tse <- makeTreeSEFromPhyloseq(ps_mia.obj) # Function to transform the data
+tse_rel <- makeTreeSEFromPhyloseq(rel_mia.obj)
+
+#Including the relative counts from Metaphlan
+assay(tse,"relabundance") <- as.data.frame(assay(tse_rel,"counts"))[match(rownames(assay(tse,"counts")),rownames(assay(tse_rel,"counts"))),] %>% select(colnames(assay(tse,"counts"))) # The rows and columns are reodered to match those of the tse object
+assay(tse,"relabundance") <- as.matrix(assay(tse,"relabundance"))
+
+# Filtering out the unwanted samples (Only keeping ON patients at baseline)
+tse_bs <- tse[!is.na(rowData(tse)$Species) & is.na(rowData(tse)$Strain),tse$disease_group == "ON_debut" & !is.na(tse$Diagnosis)]
+# Fixing the table
+rownames(tse_bs) <- gsub('[a-z]__','',rownames(tse_bs))
+
+tse_bs$Diagnosis <- as.factor(tse_bs$Diagnosis)```
 
 This initial chunk will load the main TSE objects that will be used in the code:
 
@@ -74,7 +127,7 @@ This initial chunk will load the main TSE objects that will be used in the code:
 
 11. fancy.df -> Modified dataframe for the plot of the relative abundance of DA bact
 
-Tse_filt transformations
+## Filtering the tse objects
 ```{r}
 rownames(tse_bs) <- gsub("Species:","",rownames(tse_bs))
 tse_filt <- subsetByPrevalentTaxa(tse[,tse$disease_group == "ON_debut" & !is.na(tse$Diagnosis)],
@@ -150,7 +203,6 @@ famd.df %>%
                                         family = "serif"),
                     legend.position = "bottom",
                     legend.title = element_blank())
-ggsave("final_plots/ON_baseline_FAMD.png",width = 4, height = 3, dpi = 300)
 ```
 
 ```{r}
@@ -195,7 +247,6 @@ as.data.frame(colData(tse_filt)) %>%
        y = expression(Richness[Observed])) +
   scale_color_manual(values = m.color) +
   ylim(c(0,400))
-ggsave("final_plots/ON_baseline_richness.png",width = 7,height = 7, dpi = 300)
 ```
 
 ## Evennes
@@ -223,7 +274,6 @@ as.data.frame(colData(tse_filt)) %>%
        y = "Shannon index") +
   scale_color_manual(values = m.color) +
   ylim(2,5.15)
-ggsave("final_plots/ON_baseline_shannon.png",width = 7,height = 7, dpi = 300)
 ```
 ## Faith's Phylogenetic Diversity
 
@@ -248,7 +298,6 @@ as.data.frame(colData(tse_filt)) %>%
        y = "Faith' PD") +
   scale_color_manual(values = m.color) +
   ylim(20,100)
-ggsave("final_plots/ON_baseline_FPD.png",width = 7,height = 7, dpi = 300)
 ```
 
 # Beta-diversity Measures
@@ -280,8 +329,6 @@ df %>%
         legend.position = "bottom") +
   scale_fill_manual(values = m.color) +
   scale_color_manual(values = m.color)
-
-ggsave("final_plots/ON_baseline_BC.png",width = 7,height = 7, dpi = 300)
 ```
 ```{r}
 permanova_dist("bray")
@@ -315,7 +362,6 @@ df %>%
   scale_fill_manual(values = m.color) +
   scale_color_manual(values = m.color)
 
-ggsave("final_plots/ON_baseline_Jac.png",width = 7,height = 7, dpi = 300)
 ```
 ```{r}
 permanova_dist("jaccard")
@@ -351,10 +397,8 @@ df %>%
         legend.position = "bottom") +
   scale_fill_manual(values = m.color) +
   scale_color_gradient(low="yellow",high="purple")
-  
-
-#ggsave("final_plots/ON_baseline_CB.png",width = 7,height = 7, dpi = 300)
 ```
+
 ```{r}
 colnames(colData(tse_filt))
 ```
@@ -403,8 +447,6 @@ sppscores(dbrda) <- t(assay(tse_filt,"relabundance"))
           legend.position = "None",
           axis.title = element_blank()) +
     scale_fill_manual(values = m.color)
-
-ggsave("final_plots/Permanova_BC.png", width = 7,height = 7, dpi = 300)  
 ```
 
 
@@ -444,8 +486,6 @@ ggplot(data = euclidean_pcoa_df,
         legend.position = "bottom") +
   scale_fill_manual(values = m.color) +
   scale_color_manual(values = m.color)
-
-ggsave("final_plots/ON_baseline_AD.png",width = 7,height = 7, dpi = 300)
 ```
 
 # Phylum abundances
@@ -455,8 +495,6 @@ plot_filt <- plotAbundance(tse_filt, assay_name="relabundance",rank="Phylum",ord
 plot_filt[[1]] <- plot_filt[[1]] + theme(text = element_text(family = "serif"), axis.title.x =  element_blank()) 
 plot_filt[[2]] <- plot_filt[[2]] + theme(text = element_text(family = "serif"), axis.ticks.y = element_blank()) + scale_fill_manual(values = m.color) + labs(fill = "Diagnosis")
 wrap_plots(plot_filt,nrow = 2,heights = c(0.9,0.1))
-
-ggsave("final_plots/ON_baseline_phyla.png",width = 7,height = 7, dpi = 300)
 ```
 
 # Species prevalence
@@ -620,8 +658,6 @@ volc.df %>%
                      labels = c("Yes","No")) +
   xlim(NA,20) +
   ylim(NA,60)
-
-ggsave("final_plots/Volcano_plot.png",height = 7,width = 7,dpi = 300)
 ```
 
 ```{r}
@@ -643,7 +679,6 @@ volc.df %>%
   scale_fill_manual(values = c("#28B463","#CB4335"), 
                      labels = c("Yes","No"))
 
-ggsave("final_plots/Pvalue_plot.png",height = 7,width = 7,dpi = 300)
 ```
 
 ## Overexpressed bacteria
@@ -720,8 +755,6 @@ fancy.df %>%
   scale_color_manual(values = m.color)+
   scale_x_continuous(labels = function(x) paste0((10**x )*100,"%"),limits = c(NA, 1)) +
   scale_y_discrete(labels = function(x) gsub("_"," ",x))
-
-ggsave("aaTrial.png",width=5,height = 10,dpi =300 ) 
 ```
 
 ```{r}
@@ -1210,9 +1243,6 @@ rbind(clin_da.df,clin.df,da.df) %>%
   scale_fill_manual(values = c("#28B463","#2E86C1","#CB4335")) +
   scale_y_continuous(breaks = c(0,0.25,0.5,0.75,1),
                      limits = c(0,1.1))
-
-
-ggsave("final_plots/Classifier_comparisons.png", dpi = 300)
 ```
 
 ```{r}
@@ -1243,8 +1273,6 @@ rbind(clin_da.df,clin.df,da.df,all_bact.df,all_clin.df,all_bact_clin.df) %>%
         legend.position = "bottom") +
   labs(fill = "Dataset") +
   ylim(0,NA)
-
-ggsave("final_plots/Sup/All_classifier_comparisons.png", dpi = 300)
 ```
 
 
@@ -1472,8 +1500,6 @@ fviz_famd_var(famd.res, "quanti.var", repel = TRUE,
         title = element_blank(),
         legend.key.width = unit(0.4,"cm")) +
   labs(color = "Contribution")
-
-ggsave("final_plots/Sup/FAMD_quant_var.png",,width = 2, height = 2,dpi = 300)
 ```
 
 ```{r}
@@ -1487,8 +1513,6 @@ fviz_famd_var(famd.res, "quali.var", col.var = "contrib", repel = TRUE,
         title = element_blank(),
         legend.key.width = unit(0.4,"cm")) +
   labs(color = "Contribution")
-
-ggsave("final_plots/Sup/FAMD_quali_var.png",width = 2, height = 2,dpi = 300)
 ```
 
 
@@ -1527,8 +1551,6 @@ as.data.frame(colData(tse_bs)) %>%
   theme(text = element_text(size = 7,
                               family = "serif")) +
   scale_fill_manual(values = m.color) 
-
-ggsave("final_plots/Sup/Reads_per_step.png",width=4,height=3,dpi = 300)
 ```
 
 
@@ -1545,8 +1567,6 @@ frich.df %>% ggplot(aes(x=as.numeric(size),y=richness,color=id)) +
         legend.position = "none",) +
   labs(x = "Library size",
       y = expression(Richness[observed]))
-
-ggsave("final_plots/Sup/Rarefaction_curve.png",width = 4, height = 3,dpi = 300)
 ```
 
 Difference in richness with test
@@ -1571,9 +1591,8 @@ rbind(n1,n2) %>%
   theme(text = element_text(size=15,
                             family = "serif"),
         legend.position = "None")
-  
-ggsave("final_plots/Sup/Rarefaction_diff.png",width = 4, height = 3,dpi = 300)
 ```
+
 ```{r} 
 n1 <- frich.df %>% head(n=20) %>% mutate(size = "Original") %>% select(richness,size)
 n2 <- as.data.frame(colData(tse_bs)) %>% mutate(size = "Rarefied",richness = observed) %>% select(richness,size)
@@ -1604,7 +1623,6 @@ plots <- list(plot_sp +
                 theme(text = element_text(size = 10, family = "serif"),
                       legend.key.size = unit(0.5,"cm") )) # Reorder plots
 wrap_plots(plots, ncol = 2)
-ggsave("final_plots/Sup/rareFilt_phylum_relabund.png",width=7,height = 4, dpi = 300)
 ```
 
 
@@ -1637,7 +1655,6 @@ df %>%
   scale_color_manual(values = c("#F8C471","#58D68D")) +
   ylim(0,145)
 
-ggsave("final_plots/Sup/rareFilt_FPD.png",width=4,height=4)
 ```
 
 Beta-diversity
@@ -1698,7 +1715,6 @@ pf <- df %>%
 
 pu + pf + plot_layout(guides = "collect") & theme(legend.position = "bottom")
 
-ggsave("final_plots/Sup/rareFilt_PCoA.png",width=4,height=4,dpi=300)
 ```
 
 
@@ -1782,7 +1798,6 @@ ggplot(df, aes(x = person_id, y = FeatureID, fill = clr_z)) +
   labs(x = "Samples", y = "Taxa",
        title = "MS-converters at baseline")
 
-#ggsave("ON_baseline_DE_heatmap.png",width = 30, height = 20, dpi = 300)
 ```
 
 It does not seem to be any kind of differences between both groups. Now lets plot the realtive abundances only:
@@ -1996,8 +2011,6 @@ as.data.frame(a.df) %>% mutate(Faith = as.numeric(Faith)) %>%
        x = NULL) +
   scale_color_manual(values = c("#58D68D","#F8C471"))  +
   ylim(0,130)
-
-ggsave("../Presentation/Images/RareFilt_aD.png")
 ```
 
 ## Beta diversity
@@ -2026,9 +2039,6 @@ n.df %>%
         legend.position = "bottom") +
   scale_fill_manual(values = m.color) +
   scale_color_manual(values = m.color)
-
-ggsave("../Presentation/Images/RareFilt_bD_unfiltered.png")
-
 ```
 ```{r}
 # Explained variance for each axis
@@ -2054,8 +2064,6 @@ f.df %>%
         legend.position = "bottom") +
   scale_fill_manual(values = m.color) +
   scale_color_manual(values = m.color) 
-
-ggsave("../Presentation/Images/RareFilt_bD_filtered.png")
 ```
 
 
