@@ -12,4 +12,4 @@ The main pipeline consists of an initial preprocessing of the raw fastq files us
 
   ## 3. Analyses scripts
 
-    The analyses of the results produced by MetaPhlAn were done in R. In the [R Markdown notebook](Rscripts/MIA_Thesis_final.Rmd) all the different analysis are summarized. As well, there is an RData file where the different supplementary functions that were used for the study. The Markdown file produces multiple alha and beta-diversity plots, as well as a differential abundance analysis, followed by a training and test of different Random Forest models. 
+  The analyses of the results produced by MetaPhlAn were done in R. In the [R Markdown notebook](Rscripts/MIA_Thesis_final.Rmd) all the different analysis are summarized. As well, there is an RData file where the different supplementary functions that were used for the study. The Markdown file produces multiple alha and beta-diversity plots, as well as a differential abundance analysis, followed by a training and test of different Random Forest models. 
